@@ -873,7 +873,13 @@ impl Device {
         E: FnMut(Error) + Send + 'static,
     {
         let error_callback_shared = Arc::new(Mutex::new(error_callback));
-        let configured_sample_rate = driver.sample_rate().ok().filter(|&r| r > 0.0);
+        let configured_sample_rate = match driver.sample_rate() {
+            Ok(r) if r > 0.0 => Some(r),
+            _ => {
+                // Some drivers do not report a sample rate before a stream has started.
+                None
+            }
+        };
         let driver_for_latency = driver.clone();
         let asio_streams_for_event = self.asio_streams.clone();
 
@@ -942,17 +948,22 @@ impl Device {
                     _ => false,
                 },
                 sys::AsioDriverEvent::SampleRateChanged(new_rate) => {
-                    if let Some(rate) = configured_sample_rate {
-                        if (new_rate - rate).abs() >= 1.0 {
-                            error_callback_shared
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())(
-                                Error::with_message(
-                                    ErrorKind::StreamInvalidated,
-                                    format!("ASIO driver changed sample rate to {new_rate} Hz"),
-                                ),
-                            );
+                    let should_notify = match configured_sample_rate {
+                        Some(rate) => (new_rate - rate).abs() >= 1.0,
+                        None => {
+                            // Unknown baseline: any reported change is treated as invalidating.
+                            true
                         }
+                    };
+                    if should_notify {
+                        error_callback_shared
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())(
+                            Error::with_message(
+                                ErrorKind::StreamInvalidated,
+                                format!("ASIO driver changed sample rate to {new_rate} Hz"),
+                            ),
+                        );
                     }
                     false
                 }
@@ -1113,7 +1124,7 @@ fn build_stream_err(e: sys::AsioError) -> Error {
             Error::with_message(ErrorKind::UnsupportedConfig, e.to_string())
         }
         sys::AsioError::HardwareStuck => Error::with_message(ErrorKind::DeviceBusy, e.to_string()),
-        err => Error::with_message(ErrorKind::Other, err.to_string()),
+        err => Error::with_message(ErrorKind::BackendError, err.to_string()),
     }
 }
 

@@ -14,6 +14,7 @@ use std::{
 };
 
 use crate::{
+    host::{emit_error, ErrorCallbackArc},
     traits::{DeviceTrait, HostTrait, StreamTrait},
     BufferSize, ChannelCount, Data, DeviceDescription, DeviceDescriptionBuilder, DeviceDirection,
     DeviceId, DeviceType, Error, ErrorKind, FrameCount, InputCallbackInfo, InputStreamTimestamp,
@@ -24,6 +25,8 @@ use crate::{
 
 extern crate ndk;
 use self::ndk::audio::AudioStream;
+#[cfg(feature = "realtime")]
+use crate::host::try_emit_error;
 
 mod convert;
 mod java_interface;
@@ -297,6 +300,11 @@ fn configure_for_device(
             .buffer_capacity_in_frames(size.saturating_mul(2).min(i32::MAX as FrameCount) as i32);
     }
 
+    #[cfg(feature = "realtime")]
+    {
+        builder = builder.performance_mode(ndk::audio::AudioPerformanceMode::LowLatency);
+    }
+
     builder
 }
 
@@ -304,7 +312,7 @@ fn build_input_stream<D, E>(
     device: &Device,
     config: StreamConfig,
     mut data_callback: D,
-    mut error_callback: E,
+    error_callback: E,
     builder: ndk::audio::AudioStreamBuilder,
     sample_format: SampleFormat,
 ) -> Result<Stream, Error>
@@ -315,8 +323,35 @@ where
     let builder = configure_for_device(builder, device, config);
     let channel_count = config.channels as i32;
     let sample_rate = config.sample_rate;
+
+    let error_callback: ErrorCallbackArc = Arc::new(Mutex::new(error_callback));
+    let error_callback_for_stream = error_callback.clone();
+
+    // RT check: run once on the first callback invocation to avoid delivering RealtimeDenied
+    // before the Stream handle is returned to the caller.
+    #[cfg(feature = "realtime")]
+    let mut rt_checked = false;
+    #[cfg(feature = "realtime")]
+    let error_callback_for_rt = error_callback.clone();
+
     let stream = builder
         .data_callback(Box::new(move |stream, data, num_frames| {
+            #[cfg(feature = "realtime")]
+            if !rt_checked {
+                if stream.performance_mode() != ndk::audio::AudioPerformanceMode::LowLatency {
+                    if try_emit_error(
+                        &error_callback_for_rt,
+                        Error::new(ErrorKind::RealtimeDenied),
+                    )
+                    .is_ok()
+                    {
+                        rt_checked = true;
+                    }
+                } else {
+                    rt_checked = true;
+                }
+            }
+
             let cb_info = InputCallbackInfo {
                 timestamp: InputStreamTimestamp {
                     callback: now_stream_instant(),
@@ -336,7 +371,7 @@ where
             ndk::audio::AudioCallbackResult::Continue
         }))
         .error_callback(Box::new(move |_stream, error| {
-            (error_callback)(Error::from(error))
+            emit_error(&error_callback_for_stream, Error::from(error));
         }))
         .open_stream()?;
 
@@ -354,7 +389,7 @@ fn build_output_stream<D, E>(
     device: &Device,
     config: StreamConfig,
     mut data_callback: D,
-    mut error_callback: E,
+    error_callback: E,
     builder: ndk::audio::AudioStreamBuilder,
     sample_format: SampleFormat,
 ) -> Result<Stream, Error>
@@ -370,8 +405,34 @@ where
     let tuning = Arc::new(BufferTuningState::default());
     let tuning_for_callback = tuning.clone();
 
+    let error_callback: ErrorCallbackArc = Arc::new(Mutex::new(error_callback));
+    let error_callback_for_stream = error_callback.clone();
+
+    // RT check: run once on the first callback invocation to avoid delivering RealtimeDenied
+    // before the Stream handle is returned to the caller.
+    #[cfg(feature = "realtime")]
+    let mut rt_checked = false;
+    #[cfg(feature = "realtime")]
+    let error_callback_for_rt = error_callback.clone();
+
     let stream = builder
         .data_callback(Box::new(move |stream, data, num_frames| {
+            #[cfg(feature = "realtime")]
+            if !rt_checked {
+                if stream.performance_mode() != ndk::audio::AudioPerformanceMode::LowLatency {
+                    if try_emit_error(
+                        &error_callback_for_rt,
+                        Error::new(ErrorKind::RealtimeDenied),
+                    )
+                    .is_ok()
+                    {
+                        rt_checked = true;
+                    }
+                } else {
+                    rt_checked = true;
+                }
+            }
+
             // Pre-fill with equilibrium so unwritten frames are silent.
             let n_samples: usize = (num_frames * channel_count).try_into().unwrap();
             let byte_count = n_samples * sample_format.sample_size();
@@ -435,7 +496,7 @@ where
             ndk::audio::AudioCallbackResult::Continue
         }))
         .error_callback(Box::new(move |_stream, error| {
-            (error_callback)(Error::from(error))
+            emit_error(&error_callback_for_stream, Error::from(error));
         }))
         .open_stream()?;
 
@@ -466,23 +527,6 @@ impl DeviceTrait for Device {
     type SupportedInputConfigs = SupportedInputConfigs;
     type SupportedOutputConfigs = SupportedOutputConfigs;
     type Stream = Stream;
-
-    fn name(&self) -> Result<String, Error> {
-        match &self.0 {
-            None => Ok("default".to_string()),
-            Some(info) => {
-                let name = if info.address.is_empty() {
-                    format!("{}:{:?}", info.product_name, info.device_type)
-                } else {
-                    format!(
-                        "{}:{:?}:{}",
-                        info.product_name, info.device_type, info.address
-                    )
-                };
-                Ok(name)
-            }
-        }
-    }
 
     fn description(&self) -> Result<DeviceDescription, Error> {
         match &self.0 {

@@ -15,8 +15,11 @@ This guide covers breaking changes requiring code updates. See [CHANGELOG.md](CH
 - [ ] Update `StreamInstant::from_nanos(nanos)` call sites: `nanos` is now `u64`.
 - [ ] Update `duration_since` call sites to pass by value (drop the `&`).
 - [ ] Migrate `wasm32-unknown-emscripten` to `wasm32-unknown-unknown` if possible.
+- [ ] Raise your `windows` dependency to `>= 0.61` if you pin it below that.
 - [ ] If you relied on the default config returning 44.1 kHz, pin the sample rate explicitly.
 - [ ] If you relied on the default config returning `F32`, pin the sample format explicitly.
+- [ ] **JACK**: Handle or discard the new `Result` from `Stream::connect_to_system_outputs()` and
+  `Stream::connect_to_system_inputs()`.
 
 ## 1. Unified `Error` and `ErrorKind` type
 
@@ -53,15 +56,19 @@ The `ErrorKind` variants and their equivalents from v0.17:
 
 | `ErrorKind`            | Former equivalent                                    |
 |------------------------|------------------------------------------------------|
-| `HostUnavailable`      | `HostUnavailable` (struct)                           |
-| `DeviceNotAvailable`   | `DeviceNotAvailable` in most enums                   |
 | `DeviceBusy`           | - (new; previously mapped to `DeviceNotAvailable`)   |
+| `DeviceChanged`        | - (new)                                              |
+| `DeviceNotAvailable`   | `DeviceNotAvailable` in most enums                   |
+| `HostUnavailable`      | `HostUnavailable` (struct)                           |
+| `InvalidInput`         | - (new)                                              |
+| `PermissionDenied`     | - (new)                                              |
+| `RealtimeDenied`       | - (new; previously only printed to stderr)           |
+| `ResourceExhausted`    | - (new)                                              |
+| `StreamInvalidated`    | `StreamError::StreamInvalidated`                     |
 | `UnsupportedConfig`    | `StreamConfigNotSupported`, `StreamTypeNotSupported` |
 | `UnsupportedOperation` | - (new)                                              |
-| `InvalidInput`         | - (new)                                              |
-| `StreamInvalidated`    | `StreamError::StreamInvalidated`                     |
 | `Xrun`                 | `StreamError::BufferUnderrun`                        |
-| `PermissionDenied`     | - (new)                                              |
+| `BackendError`         | - (new; previously folded into `BackendSpecific`)    |
 | `Other`                | `BackendSpecific`                                    |
 
 The `message()` getter on `Error` returns human-readable context (formerly in
@@ -194,7 +201,43 @@ unpredictable for any other format the device reported. The new ordering is comp
 consistent: floats before integers (F64 > F32 for maximum fidelity), integers by bit-depth
 descending with signed above unsigned at each width, and DSD last.
 
-## 6. `wasm32-unknown-emscripten` target removed
+## 6. `audio_thread_priority` feature renamed to `realtime-dbus` and enabled by default
+
+**What changed:** The `audio_thread_priority` feature has been renamed to `realtime-dbus` and is
+now a default feature. If you did not previously enable it, real-time scheduling will now be
+requested automatically for audio callback threads. A new `realtime` feature was also added,
+providing the same scheduling promotion without a D-Bus build dependency.
+
+```toml
+# Before (v0.17): opt-in required
+cpal = { version = "0.17", features = ["audio_thread_priority"] }
+
+# After (v0.18): on by default; rename the feature if you were opting in
+cpal = { version = "0.18" }
+
+# To opt out explicitly:
+cpal = { version = "0.18", default-features = false }
+```
+
+On Linux and BSD, `realtime-dbus` requires `libdbus-1-dev` (Debian/Ubuntu), `dbus-devel`
+(Fedora/RHEL), or equivalent at build time. On headless or embedded targets without D-Bus, use
+`realtime` instead:
+
+```toml
+cpal = { version = "0.18", default-features = false, features = ["realtime"] }
+```
+
+For both features, promotion failures are non-fatal: the stream still starts and an
+`ErrorKind::RealtimeDenied` error is delivered through `error_callback`.
+
+**Impact:** In most cases no action is needed. If your `Cargo.toml` names `audio_thread_priority`
+explicitly, rename it to `realtime-dbus`. If you relied on the opt-out behavior, pass
+`default-features = false`.
+
+**Why:** Real-time scheduling is the correct default for audio applications. The previous opt-in
+made it easy to accidentally ship without it.
+
+## 7. `wasm32-unknown-emscripten` target removed
 
 **What changed:** The `emscripten` audio host and the `wasm32-unknown-emscripten` build target are no longer supported.
 

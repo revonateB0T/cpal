@@ -12,7 +12,7 @@ extern crate ringbuf;
 
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
-    Error, InputCallbackInfo, OutputCallbackInfo, StreamConfig,
+    Error, ErrorKind, InputCallbackInfo, OutputCallbackInfo, StreamConfig,
 };
 use ringbuf::{
     traits::{Consumer, Producer, Split},
@@ -31,8 +31,8 @@ pub fn run_example() -> Result<(), anyhow::Error> {
     let output_device = host
         .default_output_device()
         .expect("failed to get default output device");
-    println!("Using default input device: \"{}\"", input_device.name()?);
-    println!("Using default output device: \"{}\"", output_device.name()?);
+    println!("Using default input device: \"{}\"", input_device.description()?.name());
+    println!("Using default output device: \"{}\"", output_device.description()?.name());
 
     // We'll try and use the same configuration between streams to keep it simple.
     let config: StreamConfig = input_device.default_input_config()?.into();
@@ -101,5 +101,8 @@ pub fn run_example() -> Result<(), anyhow::Error> {
 }
 
 fn err_fn(err: Error) {
-    eprintln!("an error occurred on stream: {err}");
+    match err.kind() {
+        ErrorKind::DeviceChanged | ErrorKind::Xrun | ErrorKind::RealtimeDenied => eprintln!("{err}"),
+        _ => eprintln!("Stream error: {err}"),
+    }
 }

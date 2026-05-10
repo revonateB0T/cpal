@@ -1,5 +1,7 @@
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::{
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
 
 pub const METADATA_NAME: &str = "metadata.name";
 

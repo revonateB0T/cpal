@@ -2,24 +2,189 @@ use std::{
     mem,
     ops::ControlFlow,
     ptr,
-    sync::mpsc::{channel, Receiver, SendError, Sender},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{channel, Receiver, SendError, Sender},
+        Arc,
+    },
     thread::{self, JoinHandle},
     time::Duration,
 };
 
 use windows::Win32::{
-    Foundation::{self, WAIT_OBJECT_0},
+    Foundation::{self, PROPERTYKEY, WAIT_OBJECT_0},
     Media::Audio,
     System::{Performance, SystemServices, Threading},
 };
 
 use crate::{
-    host::{equilibrium::fill_equilibrium, frames_to_duration},
+    host::{emit_error, equilibrium::fill_equilibrium, frames_to_duration, ErrorCallbackArc},
     traits::StreamTrait,
     Data, Error, ErrorKind, FrameCount, InputCallbackInfo, InputStreamTimestamp,
     OutputCallbackInfo, OutputStreamTimestamp, ResultExt, SampleFormat, SampleRate, StreamConfig,
     StreamInstant,
 };
+
+/// Returns the current default audio endpoint for `flow`, or `None` if none exists.
+///
+/// Used by `OnDeviceStateChanged` and `OnDeviceRemoved` to cover the edge case where the
+/// default device becomes unavailable with no replacement: in that situation Windows does
+/// not fire `OnDefaultDeviceChanged`, so these callbacks must signal the run loop instead.
+/// When a replacement *does* exist this returns `Some` and we skip signalling, letting
+/// `OnDefaultDeviceChanged` fire as the sole notifier and avoiding a double wakeup.
+fn get_current_default(flow: Audio::EDataFlow) -> Option<Audio::IMMDevice> {
+    super::device::current_default_endpoint(flow)
+}
+
+/// Fires a Windows auto-reset event when the system default audio device changes, allowing
+/// the stream run loop to deliver `ErrorKind::DeviceChanged` to the caller.
+pub(crate) struct DefaultDeviceMonitor {
+    enumerator: Audio::IMMDeviceEnumerator,
+    client: Audio::IMMNotificationClient,
+    event: Foundation::HANDLE,
+    pub(crate) pending_device_changed: Arc<AtomicBool>,
+}
+
+// SAFETY: `IMMDeviceEnumerator` and `IMMNotificationClient` are COM objects used only for
+// register/unregister (in new/drop) and `SetEvent` (from the Windows notification thread).
+// All of these are thread-safe operations on Windows.
+unsafe impl Send for DefaultDeviceMonitor {}
+unsafe impl Sync for DefaultDeviceMonitor {}
+
+impl DefaultDeviceMonitor {
+    pub fn new(
+        enumerator: Audio::IMMDeviceEnumerator,
+        flow: Audio::EDataFlow,
+    ) -> Result<Self, Error> {
+        let event =
+            unsafe { Threading::CreateEventW(None, false, false, None).map_err(Error::from)? };
+
+        let pending_device_changed = Arc::new(AtomicBool::new(false));
+        let client: Audio::IMMNotificationClient = DefaultDeviceNotificationImpl {
+            flow,
+            event,
+            pending_device_changed: pending_device_changed.clone(),
+        }
+        .into();
+
+        unsafe {
+            enumerator
+                .RegisterEndpointNotificationCallback(&client)
+                .map_err(Error::from)?;
+        }
+
+        Ok(Self {
+            enumerator,
+            client,
+            event,
+            pending_device_changed,
+        })
+    }
+}
+
+impl Drop for DefaultDeviceMonitor {
+    fn drop(&mut self) {
+        // Ensure COM is initialised on this thread before making COM calls. Drop can run on
+        // any thread (e.g. the audio run thread), which may not have called CoInitialize.
+        crate::host::com::com_initialized();
+        unsafe {
+            // Synchronous: waits for any in-progress IMMNotificationClient callback to finish
+            // before returning. Notification callbacks must not invoke the user error callback:
+            // if the user dropped the Stream in response, this call would deadlock waiting for
+            // the in-progress callback. Instead, callbacks set `pending_device_changed` and
+            // the audio thread delivers the error on its next iteration.
+            //
+            // Only close the event handle on success; if unregister fails the callback may
+            // still hold a reference and could later call SetEvent on a closed/reused handle.
+            if self
+                .enumerator
+                .UnregisterEndpointNotificationCallback(&self.client)
+                .is_ok()
+            {
+                let _ = Foundation::CloseHandle(self.event);
+            }
+        }
+    }
+}
+
+#[windows::core::implement(Audio::IMMNotificationClient)]
+struct DefaultDeviceNotificationImpl {
+    flow: Audio::EDataFlow,
+    event: Foundation::HANDLE,
+    pending_device_changed: Arc<AtomicBool>,
+}
+
+impl Audio::IMMNotificationClient_Impl for DefaultDeviceNotificationImpl_Impl {
+    fn OnDefaultDeviceChanged(
+        &self,
+        flow: Audio::EDataFlow,
+        role: Audio::ERole,
+        _pwstrdefaultdeviceid: &windows::core::PCWSTR,
+    ) -> windows::core::Result<()> {
+        if flow == self.flow && role == Audio::eConsole {
+            // SAFETY: event handle is valid for the lifetime of DefaultDeviceMonitor, which
+            // outlives all uses of this HANDLE copy.
+            unsafe {
+                if Threading::SetEvent(self.event).is_err() {
+                    self.pending_device_changed.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn OnDeviceStateChanged(
+        &self,
+        _pwstrdeviceid: &windows::core::PCWSTR,
+        dwnewstate: Audio::DEVICE_STATE,
+    ) -> windows::core::Result<()> {
+        // `DEVICE_STATE_UNPLUGGED`: physical jack disconnected; endpoint still exists in the
+        // collection but produces no audio. `OnDeviceRemoved` does *not* fire for this state.
+        // `DEVICE_STATE_NOTPRESENT`: hardware absent; endpoint may persist as a ghost record.
+        // `DEVICE_STATE_DISABLED`: device was manually disabled by the user.
+        //
+        // Only signal when there is no replacement default; if one exists `OnDefaultDeviceChanged`
+        // will fire instead, avoiding a double wakeup.
+        let is_unavailable = dwnewstate == Audio::DEVICE_STATE_DISABLED
+            || dwnewstate == Audio::DEVICE_STATE_NOTPRESENT
+            || dwnewstate == Audio::DEVICE_STATE_UNPLUGGED;
+        if is_unavailable && get_current_default(self.flow).is_none() {
+            // SAFETY: event handle is valid for the lifetime of DefaultDeviceMonitor.
+            unsafe {
+                if Threading::SetEvent(self.event).is_err() {
+                    self.pending_device_changed.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn OnDeviceAdded(&self, _pwstrdeviceid: &windows::core::PCWSTR) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn OnDeviceRemoved(&self, _pwstrdeviceid: &windows::core::PCWSTR) -> windows::core::Result<()> {
+        // Only signal when there is no replacement default; if one exists `OnDefaultDeviceChanged`
+        // will fire instead, avoiding a double wakeup.
+        if get_current_default(self.flow).is_none() {
+            // SAFETY: event handle is valid for the lifetime of DefaultDeviceMonitor.
+            unsafe {
+                if Threading::SetEvent(self.event).is_err() {
+                    self.pending_device_changed.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn OnPropertyValueChanged(
+        &self,
+        _pwstrdeviceid: &windows::core::PCWSTR,
+        _key: &PROPERTYKEY,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+}
 
 pub struct Stream {
     /// The high-priority audio processing thread calling callbacks.
@@ -42,6 +207,11 @@ pub struct Stream {
 
     // QueryPerformanceFrequency result, cached at construction (constant for the system lifetime).
     qpc_frequency: u64,
+
+    // Present for default-device streams; fires `ErrorKind::DeviceChanged` when the system
+    // default changes. Dropped after the run thread joins, ensuring the HANDLE is not
+    // waited on when it is closed.
+    _default_device_monitor: Option<DefaultDeviceMonitor>,
 }
 
 // SAFETY: Windows Event HANDLEs are safe to send between threads - they are designed for
@@ -74,6 +244,21 @@ struct RunContext {
     handles: Vec<Foundation::HANDLE>,
 
     commands: Receiver<Command>,
+
+    // Set by a device-change notification callback when SetEvent fails. The audio loop delivers
+    // DeviceChanged on its next iteration.
+    pending_device_changed: Option<Arc<AtomicBool>>,
+
+    // Owned here so the worker thread closes it on exit in a self-join case.
+    pending_scheduled_event: Foundation::HANDLE,
+}
+
+impl Drop for RunContext {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = Foundation::CloseHandle(self.pending_scheduled_event);
+        }
+    }
 }
 
 // Once we start running the eventloop, the RunContext will not be moved.
@@ -117,14 +302,14 @@ pub struct StreamInner {
 }
 
 impl Stream {
-    pub(crate) fn new_input<D, E>(
+    pub(crate) fn new_input<D>(
         stream_inner: StreamInner,
         mut data_callback: D,
-        mut error_callback: E,
-    ) -> Stream
+        error_callback: ErrorCallbackArc,
+        default_device_monitor: Option<DefaultDeviceMonitor>,
+    ) -> Result<Stream, Error>
     where
         D: FnMut(&Data, &InputCallbackInfo) + Send + 'static,
-        E: FnMut(Error) + Send + 'static,
     {
         let pending_scheduled_event = unsafe {
             Threading::CreateEventA(None, false, false, windows::core::PCSTR(ptr::null()))
@@ -140,34 +325,62 @@ impl Stream {
             debug_assert_ne!(qpc_frequency, 0, "QueryPerformanceFrequency returned zero");
         }
 
+        let mut handles = vec![pending_scheduled_event, stream_inner.event];
+        if let Some(ref monitor) = default_device_monitor {
+            handles.push(monitor.event);
+        }
+
+        let pending_device_changed = default_device_monitor
+            .as_ref()
+            .map(|m| m.pending_device_changed.clone());
         let run_context = RunContext {
-            handles: vec![pending_scheduled_event, stream_inner.event],
+            handles,
             stream: stream_inner,
             commands: rx,
+            pending_device_changed,
+            pending_scheduled_event,
         };
+
+        // The barrier prevents the worker from firing data callbacks before the caller has
+        // received the Stream handle. Without it, callbacks could arrive before the caller can
+        // pause, stop, or drop the stream.
+        let ready = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let ready_worker = ready.clone();
 
         let thread = thread::Builder::new()
             .name("cpal_wasapi_in".to_owned())
-            .spawn(move || run_input(run_context, &mut data_callback, &mut error_callback))
-            .unwrap();
+            .spawn(move || {
+                ready_worker.wait();
+                run_input(run_context, &mut data_callback, &error_callback)
+            })
+            .map_err(|e| {
+                Error::with_message(
+                    ErrorKind::ResourceExhausted,
+                    format!("failed to create thread: {e}"),
+                )
+            })?;
 
-        Stream {
+        let stream = Stream {
             thread: Some(thread),
             commands: tx,
             pending_scheduled_event,
             period_frames,
             qpc_frequency: qpc_frequency as u64,
-        }
+            _default_device_monitor: default_device_monitor,
+        };
+
+        ready.wait();
+        Ok(stream)
     }
 
-    pub(crate) fn new_output<D, E>(
+    pub(crate) fn new_output<D>(
         stream_inner: StreamInner,
         mut data_callback: D,
-        mut error_callback: E,
-    ) -> Stream
+        error_callback: ErrorCallbackArc,
+        default_device_monitor: Option<DefaultDeviceMonitor>,
+    ) -> Result<Stream, Error>
     where
         D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
-        E: FnMut(Error) + Send + 'static,
     {
         let pending_scheduled_event = unsafe {
             Threading::CreateEventA(None, false, false, windows::core::PCSTR(ptr::null()))
@@ -183,24 +396,52 @@ impl Stream {
             debug_assert_ne!(qpc_frequency, 0, "QueryPerformanceFrequency returned zero");
         }
 
+        let mut handles = vec![pending_scheduled_event, stream_inner.event];
+        if let Some(ref monitor) = default_device_monitor {
+            handles.push(monitor.event);
+        }
+
+        let pending_device_changed = default_device_monitor
+            .as_ref()
+            .map(|m| m.pending_device_changed.clone());
         let run_context = RunContext {
-            handles: vec![pending_scheduled_event, stream_inner.event],
+            handles,
             stream: stream_inner,
             commands: rx,
+            pending_device_changed,
+            pending_scheduled_event,
         };
+
+        // The barrier prevents the worker from firing data callbacks before the caller has
+        // received the Stream handle. Without it, callbacks could arrive before the caller can
+        // pause, stop, or drop the stream.
+        let ready = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let ready_worker = ready.clone();
 
         let thread = thread::Builder::new()
             .name("cpal_wasapi_out".to_owned())
-            .spawn(move || run_output(run_context, &mut data_callback, &mut error_callback))
-            .unwrap();
+            .spawn(move || {
+                ready_worker.wait();
+                run_output(run_context, &mut data_callback, &error_callback)
+            })
+            .map_err(|e| {
+                Error::with_message(
+                    ErrorKind::ResourceExhausted,
+                    format!("failed to create thread: {e}"),
+                )
+            })?;
 
-        Stream {
+        let stream = Stream {
             thread: Some(thread),
             commands: tx,
             pending_scheduled_event,
             period_frames,
             qpc_frequency: qpc_frequency as u64,
-        }
+            _default_device_monitor: default_device_monitor,
+        };
+
+        ready.wait();
+        Ok(stream)
     }
 
     fn push_command(&self, command: Command) -> Result<(), SendError<Command>> {
@@ -214,12 +455,14 @@ impl Stream {
 
 impl Drop for Stream {
     fn drop(&mut self) {
-        if self.push_command(Command::Terminate).is_ok() {
-            if let Some(handle) = self.thread.take() {
+        let _ = self.push_command(Command::Terminate);
+        if let Some(handle) = self.thread.take() {
+            // Prevent self-join: Terminate was sent; the thread exits after the current callback
+            // returns. pending_scheduled_event is closed by RunContext::drop on the worker thread,
+            // covering both the self-join case (where we cannot join here) and the normal case
+            // (where the thread exits and drops RunContext before join() returns).
+            if handle.thread().id() != std::thread::current().id() {
                 let _ = handle.join();
-            }
-            unsafe {
-                let _ = Foundation::CloseHandle(self.pending_scheduled_event);
             }
         }
     }
@@ -355,13 +598,14 @@ fn get_available_frames(stream: &StreamInner) -> Result<FrameCount, Error> {
 fn run_input(
     mut run_ctxt: RunContext,
     data_callback: &mut dyn FnMut(&Data, &InputCallbackInfo),
-    error_callback: &mut dyn FnMut(Error),
+    error_callback: &ErrorCallbackArc,
 ) {
+    #[cfg(feature = "realtime")]
     if let Err(err) = boost_current_thread_priority(
         run_ctxt.stream.period_frames,
         run_ctxt.stream.config.sample_rate,
     ) {
-        error_callback(err);
+        emit_error(error_callback, err);
     }
 
     loop {
@@ -389,13 +633,14 @@ fn run_input(
 fn run_output(
     mut run_ctxt: RunContext,
     data_callback: &mut dyn FnMut(&mut Data, &OutputCallbackInfo),
-    error_callback: &mut dyn FnMut(Error),
+    error_callback: &ErrorCallbackArc,
 ) {
+    #[cfg(feature = "realtime")]
     if let Err(err) = boost_current_thread_priority(
         run_ctxt.stream.period_frames,
         run_ctxt.stream.config.sample_rate,
     ) {
-        error_callback(err);
+        emit_error(error_callback, err);
     }
 
     loop {
@@ -420,52 +665,65 @@ fn run_output(
     }
 }
 
-#[cfg(feature = "audio_thread_priority")]
+/// Attempts to elevate the current thread to real-time or high-priority scheduling.
+#[cfg(feature = "realtime")]
 fn boost_current_thread_priority(
     period_frames: FrameCount,
     sample_rate: SampleRate,
 ) -> Result<(), Error> {
-    audio_thread_priority::promote_current_thread_to_real_time(period_frames, sample_rate)
-        .map(|_| ())
-        .map_err(Error::from)
-}
-
-#[cfg(not(feature = "audio_thread_priority"))]
-fn boost_current_thread_priority(_: FrameCount, _: SampleRate) -> Result<(), Error> {
-    unsafe {
-        let thread_handle = Threading::GetCurrentThread();
-        Threading::SetThreadPriority(thread_handle, Threading::THREAD_PRIORITY_TIME_CRITICAL)
-            .context("Failed to promote audio thread to real-time priority")
+    match audio_thread_priority::promote_current_thread_to_real_time(period_frames, sample_rate) {
+        Ok(_) => Ok(()),
+        Err(_) => unsafe {
+            let thread_handle = Threading::GetCurrentThread();
+            Threading::SetThreadPriority(thread_handle, Threading::THREAD_PRIORITY_TIME_CRITICAL)
+                .context("Failed to promote audio thread to real-time priority")
+        },
     }
 }
 
 fn process_commands_and_await_signal(
     run_context: &mut RunContext,
-    error_callback: &mut dyn FnMut(Error),
+    error_callback: &ErrorCallbackArc,
 ) -> ControlFlow<(), bool> {
     // Process queued commands.
     match process_commands(run_context) {
         Ok(true) => (),
         Ok(false) => return ControlFlow::Break(()),
         Err(err) => {
-            error_callback(err);
+            emit_error(error_callback, err);
             return ControlFlow::Break(());
         }
     };
+
+    if let Some(ref flag) = run_context.pending_device_changed {
+        if flag.swap(false, Ordering::Relaxed) {
+            emit_error(
+                error_callback,
+                Error::with_message(ErrorKind::DeviceChanged, "default audio device changed"),
+            );
+        }
+    }
 
     // Wait for any of the handles to be signalled.
     let handle_idx = match wait_for_handle_signal(&run_context.handles) {
         Ok(idx) => idx,
         Err(err) => {
-            error_callback(err);
+            emit_error(error_callback, err);
             return ControlFlow::Break(());
         }
     };
 
-    // If `handle_idx` is 0, then it's `pending_scheduled_event` that was signalled in
-    // order for us to pick up the pending commands. Otherwise, a stream needs data.
+    // Handle layout: 0 = pending_scheduled_event (commands), 1 = WASAPI audio event,
+    // 2+ = default-device change event (only present for default-device streams).
     // Continue(true)  = audio event fired, proceed to process audio this iteration.
-    // Continue(false) = command event fired, loop around and wait again.
+    // Continue(false) = command or device-change event, loop around and wait again.
+    if handle_idx >= 2 {
+        emit_error(
+            error_callback,
+            Error::with_message(ErrorKind::DeviceChanged, "default audio device changed"),
+        );
+        return ControlFlow::Continue(false);
+    }
     ControlFlow::Continue(handle_idx != 0)
 }
 
@@ -474,7 +732,7 @@ fn process_input(
     stream: &StreamInner,
     capture_client: Audio::IAudioCaptureClient,
     data_callback: &mut dyn FnMut(&Data, &InputCallbackInfo),
-    error_callback: &mut dyn FnMut(Error),
+    error_callback: &ErrorCallbackArc,
 ) -> ControlFlow<()> {
     unsafe {
         // Get the available data in the shared buffer.
@@ -485,7 +743,7 @@ fn process_input(
                 Ok(0) => return ControlFlow::Continue(()),
                 Ok(f) => f,
                 Err(err) => {
-                    error_callback(Error::from(err));
+                    emit_error(error_callback, Error::from(err));
                     return ControlFlow::Break(());
                 }
             };
@@ -502,7 +760,7 @@ fn process_input(
                 // TODO: Can this happen?
                 Err(e) if e.code() == Audio::AUDCLNT_S_BUFFER_EMPTY => continue,
                 Err(e) => {
-                    error_callback(Error::from(e));
+                    emit_error(error_callback, Error::from(e));
                     return ControlFlow::Break(());
                 }
                 Ok(_) => (),
@@ -519,7 +777,7 @@ fn process_input(
             let timestamp = match input_timestamp(stream, qpc_position) {
                 Ok(ts) => ts,
                 Err(err) => {
-                    error_callback(err);
+                    emit_error(error_callback, err);
                     return ControlFlow::Break(());
                 }
             };
@@ -531,7 +789,7 @@ fn process_input(
                 .ReleaseBuffer(frames_available)
                 .context("failed to release capture buffer");
             if let Err(err) = result {
-                error_callback(err);
+                emit_error(error_callback, err);
                 return ControlFlow::Break(());
             }
         }
@@ -543,14 +801,14 @@ fn process_output(
     stream: &StreamInner,
     render_client: Audio::IAudioRenderClient,
     data_callback: &mut dyn FnMut(&mut Data, &OutputCallbackInfo),
-    error_callback: &mut dyn FnMut(Error),
+    error_callback: &ErrorCallbackArc,
 ) -> ControlFlow<()> {
     // The number of frames available for writing.
     let frames_available = match get_available_frames(stream) {
         Ok(0) => return ControlFlow::Continue(()), // TODO: Can this happen?
         Ok(n) => n,
         Err(err) => {
-            error_callback(err);
+            emit_error(error_callback, err);
             return ControlFlow::Break(());
         }
     };
@@ -559,7 +817,7 @@ fn process_output(
         let buffer = match render_client.GetBuffer(frames_available) {
             Ok(b) => b,
             Err(e) => {
-                error_callback(Error::from(e));
+                emit_error(error_callback, Error::from(e));
                 return ControlFlow::Break(());
             }
         };
@@ -577,7 +835,7 @@ fn process_output(
         let timestamp = match output_timestamp(stream, frames_available, sample_rate) {
             Ok(ts) => ts,
             Err(err) => {
-                error_callback(err);
+                emit_error(error_callback, err);
                 return ControlFlow::Break(());
             }
         };
@@ -585,7 +843,7 @@ fn process_output(
         data_callback(&mut data, &info);
 
         if let Err(err) = render_client.ReleaseBuffer(frames_available, 0) {
-            error_callback(err.into());
+            emit_error(error_callback, err.into());
             return ControlFlow::Break(());
         }
     }

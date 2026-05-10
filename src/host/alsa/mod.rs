@@ -173,11 +173,6 @@ impl DeviceTrait for Device {
     type SupportedOutputConfigs = SupportedOutputConfigs;
     type Stream = Stream;
 
-    // ALSA overrides name() to return pcm_id directly instead of from description
-    fn name(&self) -> Result<String, Error> {
-        Self::name(self)
-    }
-
     fn description(&self) -> Result<DeviceDescription, Error> {
         Self::description(self)
     }
@@ -446,10 +441,6 @@ impl Device {
         };
 
         Ok(stream_inner)
-    }
-
-    fn name(&self) -> Result<String, Error> {
-        Ok(self.pcm_id.clone())
     }
 
     fn description(&self) -> Result<DeviceDescription, Error> {
@@ -896,7 +887,7 @@ fn input_stream_worker(
     error_callback: &mut (dyn FnMut(Error) + Send + 'static),
     timeout: Option<Duration>,
 ) {
-    #[cfg(feature = "audio_thread_priority")]
+    #[cfg(feature = "realtime")]
     if let Err(err) = boost_current_thread_priority(stream) {
         error_callback(err);
     }
@@ -947,7 +938,7 @@ fn output_stream_worker(
     error_callback: &mut (dyn FnMut(Error) + Send + 'static),
     timeout: Option<Duration>,
 ) {
-    #[cfg(feature = "audio_thread_priority")]
+    #[cfg(feature = "realtime")]
     if let Err(err) = boost_current_thread_priority(stream) {
         error_callback(err);
     }
@@ -993,7 +984,7 @@ fn output_stream_worker(
     }
 }
 
-#[cfg(feature = "audio_thread_priority")]
+#[cfg(feature = "realtime")]
 fn boost_current_thread_priority(
     stream: &StreamInner,
 ) -> Result<audio_thread_priority::RtPriorityHandle, Error> {
@@ -1273,9 +1264,17 @@ impl Stream {
         let (tx, rx) = trigger();
         let rx_thread = rx.clone();
         let stream = inner.clone();
+
+        // The barrier prevents the worker from firing data callbacks before the caller has
+        // received the Stream handle. Without it, callbacks could arrive before the caller can
+        // pause, stop, or drop the stream.
+        let ready = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let ready_worker = ready.clone();
+
         let thread = thread::Builder::new()
             .name("cpal_alsa_in".to_owned())
             .spawn(move || {
+                ready_worker.wait();
                 input_stream_worker(
                     rx_thread,
                     &stream,
@@ -1285,12 +1284,15 @@ impl Stream {
                 );
             })
             .unwrap();
-        Self {
+        let stream = Self {
             thread: Some(thread),
             inner,
             trigger: tx,
             _rx: rx,
-        }
+        };
+
+        ready.wait();
+        stream
     }
 
     fn new_output<D, E>(
@@ -1306,9 +1308,17 @@ impl Stream {
         let (tx, rx) = trigger();
         let rx_thread = rx.clone();
         let stream = inner.clone();
+
+        // The barrier prevents the worker from firing data callbacks before the caller has
+        // received the Stream handle. Without it, callbacks could arrive before the caller can
+        // pause, stop, or drop the stream.
+        let ready = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let ready_worker = ready.clone();
+
         let thread = thread::Builder::new()
             .name("cpal_alsa_out".to_owned())
             .spawn(move || {
+                ready_worker.wait();
                 output_stream_worker(
                     rx_thread,
                     &stream,
@@ -1318,12 +1328,16 @@ impl Stream {
                 );
             })
             .unwrap();
-        Self {
+
+        let stream = Self {
             thread: Some(thread),
             inner,
             trigger: tx,
             _rx: rx,
-        }
+        };
+
+        ready.wait();
+        stream
     }
 }
 
@@ -1599,7 +1613,7 @@ impl From<alsa::Error> for Error {
             libc::EINVAL => Error::with_message(ErrorKind::InvalidInput, err.to_string()),
             libc::EPIPE => Error::with_message(ErrorKind::Xrun, err.to_string()),
             libc::ENOSYS => Error::with_message(ErrorKind::UnsupportedOperation, err.to_string()),
-            _ => Error::with_message(ErrorKind::Other, err.to_string()),
+            _ => Error::with_message(ErrorKind::BackendError, err.to_string()),
         }
     }
 }

@@ -50,12 +50,13 @@ If you are interested in using CPAL with WebAssembly, please see [this guide](ht
 | Feature | Platform | Description |
 |---------|----------|-------------|
 | `asio` | Windows | ASIO backend for low-latency audio, bypassing the Windows audio stack. Requires ASIO drivers and LLVM/Clang. See the [ASIO setup guide](#asio). |
-| `audio_thread_priority` | Linux, BSD, Windows | Raises the audio callback thread to real-time priority for lower latency and fewer glitches. On Linux, requires `rtkit` or appropriate user permissions (`limits.conf` or capabilities). |
 | `audioworklet` | WebAssembly (`wasm32-unknown-unknown`) | Audio Worklet backend for lower-latency web audio than the default Web Audio API, running audio on a dedicated thread. Requires atomics support (`RUSTFLAGS="-C target-feature=+atomics,+bulk-memory,+mutable-globals"`) and `Cross-Origin` headers for `SharedArrayBuffer`. See the `audioworklet-beep` example. |
 | `custom` | All | User-defined host implementations for audio systems not natively supported by CPAL. See `examples/custom.rs`. |
 | `jack` | Linux, BSD, macOS, Windows | JACK Audio Connection Kit backend for pro-audio routing and inter-application connectivity. Requires `libjack-jackd2-dev` (Debian/Ubuntu) or `jack-devel` (Fedora). |
 | `pipewire` | Linux, BSD | PipeWire media server backend. Requires `libpipewire-0.3-dev` (Debian/Ubuntu) or `pipewire-devel` (Fedora). |
 | `pulseaudio` | Linux, BSD | PulseAudio sound server backend. Requires `libpulse-dev` (Debian/Ubuntu) or `pulseaudio-libs-devel` (Fedora). |
+| `realtime` | Linux, BSD, Windows, Android | Raises the audio callback thread to real-time or high-priority scheduling for lower latency. On Linux/BSD, requires `rtprio` granted in `limits.conf` (e.g. `@audio - rtprio 95`) unless `realtime-dbus` is also enabled. |
+| `realtime-dbus` | Linux, BSD, Windows, Android | Uses `rtkit` via D-Bus for RT scheduling on Linux/BSD desktop systems, removing the need for manual `limits.conf` setup. Implies `realtime` on all platforms. Enabled by default. |
 | `wasm-bindgen` | WebAssembly (`wasm32-unknown-unknown`) | Web Audio API backend for browser-based audio; required for any WebAssembly audio support. See the `wasm-beep` example. |
 
 See the [beep example](examples/beep.rs) for selecting the host at runtime.

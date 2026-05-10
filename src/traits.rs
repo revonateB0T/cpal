@@ -51,10 +51,10 @@ pub trait HostTrait {
     ///
     /// - [`ErrorKind::HostUnavailable`] if the host has become unreachable (e.g. the audio
     ///   daemon crashed or was stopped).
-    /// - [`ErrorKind::Other`] for unclassifiable backend failures.
+    /// - [`ErrorKind::BackendError`] for unclassifiable backend failures.
     ///
     /// [`ErrorKind::HostUnavailable`]: crate::ErrorKind::HostUnavailable
-    /// [`ErrorKind::Other`]: crate::ErrorKind::Other
+    /// [`ErrorKind::BackendError`]: crate::ErrorKind::BackendError
     fn devices(&self) -> Result<Self::Devices, Error>;
 
     /// Fetches a [`Device`](DeviceTrait) based on a [`DeviceId`] if available
@@ -115,17 +115,6 @@ pub trait DeviceTrait {
     /// [`build_input_stream_raw`]: Self::build_input_stream_raw
     /// [`build_output_stream_raw`]: Self::build_output_stream_raw
     type Stream: StreamTrait;
-
-    /// The human-readable name of the device.
-    #[deprecated(
-        since = "0.17.0",
-        note = "Use `description()` for comprehensive device information including name, \
-                manufacturer, and device type. Use `id()` for a unique, stable device identifier \
-                that persists across reboots and reconnections."
-    )]
-    fn name(&self) -> Result<String, Error> {
-        self.description().map(|desc| desc.name().to_string())
-    }
 
     /// Structured description of the device with metadata.
     ///
@@ -460,7 +449,7 @@ pub trait StreamTrait {
     /// # Errors
     ///
     /// - [`ErrorKind::UnsupportedOperation`] if the backend cannot query the buffer size.
-    /// - [`ErrorKind::Other`] for unclassifiable backend failures.
+    /// - [`ErrorKind::BackendError`] for unclassifiable backend failures.
     ///
     /// # Implementation notes
     ///
@@ -472,7 +461,7 @@ pub trait StreamTrait {
     /// lead to memory safety violations.
     ///
     /// [`ErrorKind::UnsupportedOperation`]: crate::ErrorKind::UnsupportedOperation
-    /// [`ErrorKind::Other`]: crate::ErrorKind::Other
+    /// [`ErrorKind::BackendError`]: crate::ErrorKind::BackendError
     fn buffer_size(&self) -> Result<crate::FrameCount, Error>;
 
     /// Returns a [`StreamInstant`] representing the current moment on the stream's clock.

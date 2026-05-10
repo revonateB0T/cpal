@@ -1,7 +1,10 @@
 use std::{
     cell::RefCell,
     rc::Rc,
-    sync::{atomic::AtomicU64, Arc},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     thread,
     time::Duration,
 };
@@ -16,8 +19,15 @@ use pipewire::{
 
 use super::stream::Stream;
 use crate::{
-    host::pipewire::stream::{PwInitGuard, StreamCommand, StreamData, SUPPORTED_FORMATS},
-    host::pipewire::utils::{audio, clock, default, node, DEVICE_ICON_NAME, METADATA_NAME},
+    host::{
+        emit_error,
+        pipewire::{
+            stream::{
+                DefaultDeviceMonitor, PwInitGuard, StreamCommand, StreamData, SUPPORTED_FORMATS,
+            },
+            utils::{audio, clock, default, node, DEVICE_ICON_NAME, METADATA_NAME},
+        },
+    },
     iter::{SupportedInputConfigs, SupportedOutputConfigs},
     traits::DeviceTrait,
     BufferSize, ChannelCount, Data, DeviceDescription, DeviceDescriptionBuilder, DeviceDirection,
@@ -310,6 +320,7 @@ impl DeviceTrait for Device {
         let (pw_play_tx, pw_play_rx) = pw::channel::channel::<StreamCommand>();
 
         let (pw_init_tx, pw_init_rx) = std::sync::mpsc::channel::<bool>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<()>(0);
         let device = self.clone();
         let wait_timeout = timeout.unwrap_or(Duration::from_secs(2));
         let initial_quantum = match config.buffer_size {
@@ -324,13 +335,18 @@ impl DeviceTrait for Device {
             .spawn(move || {
                 let _pw = PwInitGuard::new();
                 let properties = device.pw_properties(DeviceDirection::Input, &config);
+
                 let Ok(StreamData {
                     mainloop,
                     listener,
                     stream,
                     context,
-                    default_monitor,
+                    core,
                     core_monitor,
+                    error_callback,
+                    pending_device_changed,
+                    invalidated,
+                    is_default_device,
                 }) = super::stream::connect_input(
                     super::stream::ConnectParams {
                         config,
@@ -338,7 +354,6 @@ impl DeviceTrait for Device {
                         sample_format,
                         last_quantum: last_quantum_clone,
                         start,
-                        default_metadata_key: device.default_metadata_key(),
                     },
                     data_callback,
                     error_callback,
@@ -348,33 +363,99 @@ impl DeviceTrait for Device {
                     return;
                 };
                 let _ = pw_init_tx.send(true);
+
+                // Wait until the caller has received the Stream handle before running the
+                // mainloop or invoking any callbacks. If the caller timed out and dropped
+                // ready_tx, exit cleanly.
+                if ready_rx.recv().is_err() {
+                    return;
+                }
+
+                let default_monitor =
+                    if let Some(key) = device.default_metadata_key() {
+                        match core.get_registry_rc() {
+                            Ok(registry) => Some(DefaultDeviceMonitor::new(
+                                registry,
+                                key,
+                                error_callback.clone(),
+                                invalidated,
+                                pending_device_changed,
+                            )),
+                            Err(e) => {
+                                emit_error(
+                                    &error_callback,
+                                    Error::with_message(
+                                        ErrorKind::BackendError,
+                                        format!("PipeWire: could not acquire registry; device change notifications will be unavailable: {e}"),
+                                    ),
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                is_default_device.store(default_monitor.is_some(), Ordering::Relaxed);
                 let stream = stream.clone();
                 let mainloop_rc1 = mainloop.clone();
+
+                #[cfg(feature = "realtime")]
+                let error_callback_rt = error_callback.clone();
                 let _receiver = pw_play_rx.attach(mainloop.loop_(), move |play| match play {
                     StreamCommand::Toggle(state) => {
-                        let _ = stream.set_active(state);
+                        if let Err(e) = stream.set_active(state) {
+                            emit_error(
+                                &error_callback,
+                                Error::with_message(
+                                    ErrorKind::StreamInvalidated,
+                                    format!("PipeWire: set_active({state}) failed: {e}"),
+                                ),
+                            );
+                        }
                     }
                     StreamCommand::Stop => {
-                        let _ = stream.disconnect();
+                        if let Err(e) = stream.disconnect() {
+                            emit_error(
+                                &error_callback,
+                                Error::with_message(
+                                    ErrorKind::StreamInvalidated,
+                                    format!("PipeWire: stream disconnect failed: {e}"),
+                                ),
+                            );
+                        }
                         mainloop_rc1.quit();
                     }
                 });
+
+                #[cfg(feature = "realtime")]
+                if let Err(e) = audio_thread_priority::promote_current_thread_to_real_time(
+                    device.quantum,
+                    device.rate,
+                ) {
+                    emit_error(&error_callback_rt, Error::from(e));
+                }
+
                 mainloop.run();
                 drop(listener);
                 drop(default_monitor);
                 drop(core_monitor);
+                drop(core);
                 drop(context);
             })
             .map_err(|e| {
-                Error::with_message(ErrorKind::Other, format!("failed to create thread: {e}"))
+                Error::with_message(ErrorKind::ResourceExhausted, format!("failed to create thread: {e}"))
             })?;
         match pw_init_rx.recv_timeout(wait_timeout) {
-            Ok(true) => Ok(Stream {
-                handle: Some(handle),
-                controller: pw_play_tx,
-                last_quantum,
-                start,
-            }),
+            Ok(true) => {
+                let stream = Stream {
+                    handle: Some(handle),
+                    controller: pw_play_tx,
+                    last_quantum,
+                    start,
+                };
+                let _ = ready_tx.send(());
+                Ok(stream)
+            }
             Ok(false) => Err(Error::with_message(
                 ErrorKind::UnsupportedConfig,
                 "stream configuration rejected by PipeWire",
@@ -401,6 +482,7 @@ impl DeviceTrait for Device {
         let (pw_play_tx, pw_play_rx) = pw::channel::channel::<StreamCommand>();
 
         let (pw_init_tx, pw_init_rx) = std::sync::mpsc::channel::<bool>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<()>(0);
         let device = self.clone();
         let wait_timeout = timeout.unwrap_or(Duration::from_secs(2));
         let initial_quantum = match config.buffer_size {
@@ -421,8 +503,12 @@ impl DeviceTrait for Device {
                     listener,
                     stream,
                     context,
-                    default_monitor,
+                    core,
                     core_monitor,
+                    error_callback,
+                    pending_device_changed,
+                    invalidated,
+                    is_default_device,
                 }) = super::stream::connect_output(
                     super::stream::ConnectParams {
                         config,
@@ -430,7 +516,6 @@ impl DeviceTrait for Device {
                         sample_format,
                         last_quantum: last_quantum_clone,
                         start,
-                        default_metadata_key: device.default_metadata_key(),
                     },
                     data_callback,
                     error_callback,
@@ -441,33 +526,99 @@ impl DeviceTrait for Device {
                 };
 
                 let _ = pw_init_tx.send(true);
+
+                // Wait until the caller has received the Stream handle before running the
+                // mainloop or invoking any callbacks. If the caller timed out and dropped
+                // ready_tx, exit cleanly.
+                if ready_rx.recv().is_err() {
+                    return;
+                }
+
+                let default_monitor =
+                    if let Some(key) = device.default_metadata_key() {
+                        match core.get_registry_rc() {
+                            Ok(registry) => Some(DefaultDeviceMonitor::new(
+                                registry,
+                                key,
+                                error_callback.clone(),
+                                invalidated,
+                                pending_device_changed,
+                            )),
+                            Err(e) => {
+                                emit_error(
+                                    &error_callback,
+                                    Error::with_message(
+                                        ErrorKind::BackendError,
+                                        format!("PipeWire: could not acquire registry; device change notifications will be unavailable: {e}"),
+                                    ),
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                is_default_device.store(default_monitor.is_some(), Ordering::Relaxed);
                 let stream = stream.clone();
                 let mainloop_rc1 = mainloop.clone();
+
+                #[cfg(feature = "realtime")]
+                let error_callback_rt = error_callback.clone();
                 let _receiver = pw_play_rx.attach(mainloop.loop_(), move |play| match play {
                     StreamCommand::Toggle(state) => {
-                        let _ = stream.set_active(state);
+                        if let Err(e) = stream.set_active(state) {
+                            emit_error(
+                                &error_callback,
+                                Error::with_message(
+                                    ErrorKind::StreamInvalidated,
+                                    format!("PipeWire: set_active({state}) failed: {e}"),
+                                ),
+                            );
+                        }
                     }
                     StreamCommand::Stop => {
-                        let _ = stream.disconnect();
+                        if let Err(e) = stream.disconnect() {
+                            emit_error(
+                                &error_callback,
+                                Error::with_message(
+                                    ErrorKind::StreamInvalidated,
+                                    format!("PipeWire: stream disconnect failed: {e}"),
+                                ),
+                            );
+                        }
                         mainloop_rc1.quit();
                     }
                 });
+
+                #[cfg(feature = "realtime")]
+                if let Err(e) = audio_thread_priority::promote_current_thread_to_real_time(
+                    device.quantum,
+                    device.rate,
+                ) {
+                    emit_error(&error_callback_rt, Error::from(e));
+                }
+
                 mainloop.run();
                 drop(listener);
                 drop(default_monitor);
                 drop(core_monitor);
+                drop(core);
                 drop(context);
             })
             .map_err(|e| {
-                Error::with_message(ErrorKind::Other, format!("failed to create thread: {e}"))
+                Error::with_message(ErrorKind::ResourceExhausted, format!("failed to create thread: {e}"))
             })?;
         match pw_init_rx.recv_timeout(wait_timeout) {
-            Ok(true) => Ok(Stream {
-                handle: Some(handle),
-                controller: pw_play_tx,
-                last_quantum,
-                start,
-            }),
+            Ok(true) => {
+                let stream = Stream {
+                    handle: Some(handle),
+                    controller: pw_play_tx,
+                    last_quantum,
+                    start,
+                };
+                let _ = ready_tx.send(());
+                Ok(stream)
+            }
             Ok(false) => Err(Error::with_message(
                 ErrorKind::UnsupportedConfig,
                 "stream configuration rejected by PipeWire",

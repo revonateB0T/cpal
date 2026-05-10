@@ -87,7 +87,7 @@ impl From<pulseaudio::ClientError> for Error {
                     ErrorKind::StreamInvalidated
                 }
                 NoData => ErrorKind::Xrun,
-                _ => ErrorKind::Other,
+                _ => ErrorKind::BackendError,
             }
         }
 
@@ -255,15 +255,6 @@ impl DeviceTrait for Device {
     type SupportedInputConfigs = std::vec::IntoIter<SupportedStreamConfigRange>;
     type SupportedOutputConfigs = std::vec::IntoIter<SupportedStreamConfigRange>;
     type Stream = Stream;
-
-    fn name(&self) -> Result<String, Error> {
-        let name = match self {
-            Device::Sink { info, .. } => &info.name,
-            Device::Source { info, .. } => &info.name,
-        };
-
-        Ok(String::from_utf8_lossy(name.as_bytes()).into_owned())
-    }
 
     fn supported_input_configs(&self) -> Result<Self::SupportedInputConfigs, Error> {
         let Device::Source { .. } = self else {

@@ -10,11 +10,19 @@ edition = "2021"
 rust-version = "1.78"
 
 [features]
-# Audio thread priority elevation
-# Raises the audio callback thread to real-time priority for lower latency and fewer glitches
-# Requires: On Linux, either rtkit or appropriate user permissions (e.g. limits.conf or capabilities)
-# Platform: Linux, DragonFly BSD, FreeBSD, NetBSD, Windows
-audio_thread_priority = ["dep:audio_thread_priority"]
+default = ["realtime-dbus"]
+
+# Real-time audio thread scheduling
+# Promotes audio callback threads to real-time or high-priority scheduling for lower latency
+# Requires: (Linux/BSD) `rtprio` granted in `limits.conf` (e.g. `@audio - rtprio 95`)
+# Platform: Linux, DragonFly BSD, FreeBSD, NetBSD, Windows, Android
+realtime = ["dep:audio_thread_priority"]
+
+# D-Bus/rtkit support on top of `realtime` for RT scheduling on Linux/BSD desktop systems
+# Requires: D-Bus development libraries (libdbus-1-dev or equivalent)
+# Platform: Linux, DragonFly BSD, FreeBSD, NetBSD (D-Bus/rtkit is a no-op elsewhere; thread
+#           priority promotion from `realtime` still applies on Windows and Android)
+realtime-dbus = ["realtime", "audio_thread_priority/with_dbus"]
 
 # ASIO backend for Windows
 # Provides low-latency audio I/O by bypassing the Windows audio stack
@@ -40,7 +48,6 @@ audioworklet = [
 ]
 
 # Support for user-defined custom hosts, devices, and streams
-# Allows integration with audio systems not natively supported by CPAL
 # See examples/custom.rs for usage
 # Platform: All platforms
 custom = []
@@ -82,9 +89,11 @@ clap = { version = ">=4.0, <=4.5.57", features = ["derive"] }
 
 # Support a range of versions in order to avoid duplication of this crate. Make sure to test all
 # versions when bumping to a new release, and only increase the minimum when absolutely necessary.
-# When updating this, also update the "windows-version" matrix in the CI workflow.
+# windows 0.61 removed the `implement` feature flag, so #[windows::core::implement] works
+# unconditionally from 0.61 onward. Keep the upper bound in sync with the CI matrix below.
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = ">=0.59, <=0.62", features = [
+windows-core = { version = ">=0.61, <=0.62" }
+windows = { version = ">=0.61, <=0.62", features = [
     "Win32_Media",
     "Win32_Media_Audio",
     "Win32_Foundation",
@@ -99,7 +108,7 @@ windows = { version = ">=0.59, <=0.62", features = [
     "Win32_Media_Multimedia",
     "Win32_UI_Shell_PropertiesSystem",
 ] }
-audio_thread_priority = { version = "0.34", optional = true }
+audio_thread_priority = { version = "0.35", optional = true, default-features = false }
 asio-sys = { version = "0.3.0", path = "asio-sys", optional = true }
 num-traits = { version = "0.2", optional = true }
 jack = { version = "0.13", optional = true }
@@ -107,7 +116,7 @@ jack = { version = "0.13", optional = true }
 [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd"))'.dependencies]
 alsa = "0.11"
 libc = "0.2"
-audio_thread_priority = { version = "0.34", optional = true }
+audio_thread_priority = { version = "0.35", optional = true, default-features = false }
 jack = { version = "0.13", optional = true }
 pulseaudio = { version = "0.3", optional = true }
 futures = { version = "0.3", optional = true }
@@ -115,7 +124,7 @@ pipewire = { version = "0.9", optional = true, features = ["v0_3_53"] }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 mach2 = "0.6"
-coreaudio-rs = { version = "0.14", default-features = false, features = [
+coreaudio-rs = { version = "0.14.2", default-features = false, features = [
     "core_audio",
     "audio_toolbox",
 ] }
@@ -177,6 +186,7 @@ web-sys = { version = "0.3", features = [
 ] }
 
 [target.'cfg(target_os = "android")'.dependencies]
+audio_thread_priority = { version = "0.35", optional = true, default-features = false }
 ndk = { version = "0.9", default-features = false, features = [
     "audio",
     "api-level-26",

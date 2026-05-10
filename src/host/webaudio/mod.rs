@@ -15,11 +15,14 @@ use std::{
     time::Duration,
 };
 
+type OutputDataCallbackArc = Arc<Mutex<dyn FnMut(&mut Data, &OutputCallbackInfo) + Send>>;
+
 use self::{
     wasm_bindgen::{prelude::*, JsCast},
     web_sys::{AudioContext, AudioContextOptions},
 };
 use crate::{
+    host::ErrorCallbackArc,
     traits::{DeviceTrait, HostTrait, StreamTrait},
     BufferSize, ChannelCount, Data, DeviceDescription, DeviceDescriptionBuilder, DeviceDirection,
     DeviceId, Error, ErrorKind, FrameCount, InputCallbackInfo, OutputCallbackInfo,
@@ -250,10 +253,8 @@ impl DeviceTrait for Device {
         let buffer_size_samples = buffer_size_frames * n_channels;
         let buffer_time_step_secs = buffer_time_step_secs(buffer_size_frames, config.sample_rate);
 
-        let data_callback = Arc::new(Mutex::new(Box::new(data_callback)));
-        let error_callback = Arc::new(Mutex::new(
-            Box::new(error_callback) as Box<dyn FnMut(Error) + Send + 'static>
-        ));
+        let data_callback: OutputDataCallbackArc = Arc::new(Mutex::new(data_callback));
+        let error_callback: ErrorCallbackArc = Arc::new(Mutex::new(error_callback));
         let is_started = Arc::new(AtomicBool::new(false));
 
         // Create the WebAudio stream.

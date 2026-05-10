@@ -20,7 +20,7 @@ use self::enumerate::{
 };
 use super::{asbd_from_config, host_time_to_stream_instant};
 use crate::{
-    host::{frames_to_duration, try_emit_error},
+    host::{frames_to_duration, try_emit_error, ErrorCallbackArc},
     traits::{DeviceTrait, HostTrait, StreamTrait},
     BufferSize, ChannelCount, Data, DeviceDescription, DeviceDescriptionBuilder, DeviceId, Error,
     ErrorKind, FrameCount, InputCallbackInfo, InputStreamTimestamp, OutputCallbackInfo,
@@ -30,7 +30,7 @@ use crate::{
 
 pub mod enumerate;
 mod session_event_manager;
-use session_event_manager::{ErrorCallbackMutex, SessionEventManager};
+use session_event_manager::SessionEventManager;
 
 // These days the default of iOS is now F32 and no longer I16
 const SUPPORTED_SAMPLE_FORMAT: SampleFormat = SampleFormat::F32;
@@ -173,7 +173,7 @@ impl DeviceTrait for Device {
         // Query device buffer size for latency calculation
         let device_buffer_frames = Some(get_device_buffer_frames());
 
-        let error_callback: ErrorCallbackMutex = Arc::new(Mutex::new(Box::new(error_callback)));
+        let error_callback: ErrorCallbackArc = Arc::new(Mutex::new(error_callback));
         let session_manager = SessionEventManager::new(error_callback.clone());
 
         // Set up input callback
@@ -184,7 +184,7 @@ impl DeviceTrait for Device {
             device_buffer_frames,
             data_callback,
             move |e| {
-                try_emit_error(&error_callback, e);
+                let _ = try_emit_error(&error_callback, e);
             },
         )?;
 
@@ -218,7 +218,7 @@ impl DeviceTrait for Device {
         // Query device buffer size for latency calculation
         let device_buffer_frames = Some(get_device_buffer_frames());
 
-        let error_callback: ErrorCallbackMutex = Arc::new(Mutex::new(Box::new(error_callback)));
+        let error_callback: ErrorCallbackArc = Arc::new(Mutex::new(error_callback));
         let session_manager = SessionEventManager::new(error_callback.clone());
 
         // Set up output callback
@@ -229,7 +229,7 @@ impl DeviceTrait for Device {
             device_buffer_frames,
             data_callback,
             move |e| {
-                try_emit_error(&error_callback, e);
+                let _ = try_emit_error(&error_callback, e);
             },
         )?;
 
@@ -304,7 +304,7 @@ struct StreamInner {
 }
 
 fn create_audio_unit() -> Result<AudioUnit, coreaudio::Error> {
-    AudioUnit::new(coreaudio::audio_unit::IOType::RemoteIO)
+    AudioUnit::new_uninitialized(coreaudio::audio_unit::IOType::RemoteIO)
 }
 
 fn configure_for_recording(audio_unit: &mut AudioUnit) -> Result<(), coreaudio::Error> {
@@ -423,9 +423,7 @@ fn setup_stream_audio_unit(
     let mut audio_unit = create_audio_unit()?;
 
     if is_input {
-        audio_unit.uninitialize()?;
         configure_for_recording(&mut audio_unit)?;
-        audio_unit.initialize()?;
     }
 
     // Set the stream format in interleaved mode
@@ -439,6 +437,8 @@ fn setup_stream_audio_unit(
 
     let asbd = asbd_from_config(config, sample_format);
     audio_unit.set_property(kAudioUnitProperty_StreamFormat, scope, element, Some(&asbd))?;
+
+    audio_unit.initialize()?;
 
     Ok(audio_unit)
 }
