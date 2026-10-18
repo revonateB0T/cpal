@@ -541,16 +541,11 @@ where
     let capacity = stream.buffer_capacity_in_frames();
     tuning.capacity.store(capacity, Ordering::Relaxed);
 
-    let mixer_bursts = match AudioManager::get_mixer_bursts() {
-        Ok(bursts) => bursts.max(0),
-        Err(_) => {
-            let burst_size = stream.frames_per_burst();
-            if burst_size > 0 {
-                stream.buffer_size_in_frames() / burst_size
-            } else {
-                0 // defer to dynamic tuning
-            }
-        }
+    let burst_size = stream.frames_per_burst();
+    let mixer_bursts = if burst_size > 0 {
+        stream.buffer_size_in_frames() / burst_size
+    } else {
+        0 // defer to dynamic tuning
     };
     tuning.mixer_bursts.store(mixer_bursts, Ordering::Relaxed);
 
